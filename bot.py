@@ -1,5 +1,6 @@
 import os
 import time
+import sqlite3
 import logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
@@ -25,25 +26,63 @@ PIVOT_RIGHT       = int(os.environ.get("PIVOT_RIGHT", "5"))
 CLUSTER_TOLERANCE = float(os.environ.get("CLUSTER_TOLERANCE", "0.6"))
 MIN_TOUCHES       = int(os.environ.get("MIN_TOUCHES", "2"))
 
-# نطاقات التنبيه (نسبة مئوية من السعر الحالي)
-ENTRY_PCT         = float(os.environ.get("ENTRY_PCT", "0.8"))   # مسافة الدخول الفعلي
-EARLY_PCT         = float(os.environ.get("EARLY_PCT", "2.5"))   # مسافة الإنذار المبكر
-
-# فلاتر جودة الصفقة (تُطبق على تنبيه الدخول فقط، وليس على الإنذار المبكر)
-MIN_RANGE_WIDTH   = float(os.environ.get("MIN_RANGE_WIDTH", "1.5"))  # أدنى عرض للنطاق %
-MIN_RR            = float(os.environ.get("MIN_RR", "1.3"))           # أدنى نسبة ربح/خسارة
-
-# مدة كتم التنبيهات (ثواني) لكل نوع
-COOLDOWN_EARLY    = int(os.environ.get("COOLDOWN_EARLY", "7200"))    # ساعتان
-COOLDOWN_ENTRY    = int(os.environ.get("COOLDOWN_ENTRY", "3600"))    # ساعة
-
-# مسافة وقف الخسارة الافتراضية (نسبة مئوية) لحساب R:R
+ENTRY_PCT         = float(os.environ.get("ENTRY_PCT", "0.8"))
+EARLY_PCT         = float(os.environ.get("EARLY_PCT", "2.5"))
+MIN_RANGE_WIDTH   = float(os.environ.get("MIN_RANGE_WIDTH", "1.5"))
+MIN_RR            = float(os.environ.get("MIN_RR", "1.3"))
 STOP_BUFFER_PCT   = float(os.environ.get("STOP_BUFFER_PCT", "0.6"))
+
+COOLDOWN_EARLY    = int(os.environ.get("COOLDOWN_EARLY", "7200"))
+COOLDOWN_ENTRY    = int(os.environ.get("COOLDOWN_ENTRY", "3600"))
+
+DB_PATH = os.environ.get("DB_PATH", "alerts.db")
 
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
 
-# ذاكرة التنبيهات: {(symbol, kind, level, alert_type): last_ts}
-ALERT_STATE = {}
+# ================== قاعدة البيانات ==================
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS alert_state (
+            symbol     TEXT NOT NULL,
+            kind       TEXT NOT NULL,
+            level      REAL NOT NULL,
+            alert_type TEXT NOT NULL,
+            last_ts    REAL NOT NULL,
+            PRIMARY KEY (symbol, kind, level, alert_type)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def get_last_alert(symbol, kind, level, alert_type):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute(
+        "SELECT last_ts FROM alert_state "
+        "WHERE symbol=? AND kind=? AND level=? AND alert_type=?",
+        (symbol, kind, round(level, 2), alert_type)
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else 0.0
+
+def set_last_alert(symbol, kind, level, alert_type, ts):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT OR REPLACE INTO alert_state "
+        "(symbol, kind, level, alert_type, last_ts) VALUES (?, ?, ?, ?, ?)",
+        (symbol, kind, round(level, 2), alert_type, ts)
+    )
+    conn.commit()
+    conn.close()
+
+def should_alert(symbol, kind, level, alert_type, cooldown):
+    now = time.time()
+    last = get_last_alert(symbol, kind, level, alert_type)
+    if now - last < cooldown:
+        return False
+    set_last_alert(symbol, kind, level, alert_type, now)
+    return True
 
 # ================== Binance ==================
 def fetch_klines(symbol, interval="1h", limit=300):
@@ -101,7 +140,7 @@ def cluster_levels(levels, tolerance_pct):
         })
     return result
 
-# ================== إرسال تلغرام ==================
+# ================== تلغرام ==================
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -117,22 +156,10 @@ def send_telegram(text):
     except Exception as e:
         log.exception(f"Telegram exception: {e}")
 
-# ================== منع التكرار ==================
-def should_alert(symbol, kind, level, alert_type, cooldown):
-    key = (symbol, kind, round(level, 2), alert_type)
-    now = time.time()
-    if now - ALERT_STATE.get(key, 0) < cooldown:
-        return False
-    ALERT_STATE[key] = now
-    return True
-
 # ================== رسالة التنبيه ==================
 def build_message(alert_type, symbol, label, zone, current_price, dist,
                   range_width=None, rr=None):
-    if alert_type == "ENTRY":
-        header = "🚨 <b>تنبيه دخول</b>"
-    else:
-        header = "⏳ <b>إنذار مبكر</b>"
+    header = "🚨 <b>تنبيه دخول</b>" if alert_type == "ENTRY" else "⏳ <b>إنذار مبكر</b>"
 
     lines = [
         header,
@@ -173,88 +200,83 @@ def check_symbol(symbol):
     nearest_sup = max(support_zones, key=lambda z: z["price"]) \
                   if support_zones else None
 
-    # حساب المسافات
     res_dist = (nearest_res["price"] - current_price) / current_price * 100 \
                if nearest_res else 999.0
     sup_dist = (current_price - nearest_sup["price"]) / current_price * 100 \
                if nearest_sup else 999.0
 
-    # تحديد الجهة الأقرب (إشارة واحدة لكل عملة في كل دورة)
     if res_dist <= sup_dist:
-        side = "RES"
-        label = "🟥 مقاومة"
-        zone = nearest_res
-        dist = res_dist
+        side, label, zone, dist = "RES", "🟥 مقاومة", nearest_res, res_dist
     else:
-        side = "SUP"
-        label = "🟩 دعم"
-        zone = nearest_sup
-        dist = sup_dist
+        side, label, zone, dist = "SUP", "🟩 دعم", nearest_sup, sup_dist
 
     if zone is None:
         return
 
-    # عرض النطاق (فقط إن وُجد الطرفان)
     range_width = None
     if nearest_res and nearest_sup:
         range_width = (nearest_res["price"] - nearest_sup["price"]) / current_price * 100
 
-    # ============ المسار 1: تنبيه دخول ============
+    # ---- تنبيه دخول ----
     if dist <= ENTRY_PCT:
-        # فلتر النطاق الضيق
         if range_width is not None and range_width < MIN_RANGE_WIDTH:
-            log.info(f"{symbol}: نطاق ضيق ({range_width:.2f}%) - تجاهل تنبيه الدخول")
+            log.info(f"{symbol}: نطاق ضيق ({range_width:.2f}%) - تجاهل دخول")
             return
 
-        # حساب R:R تقديري
         opposite = nearest_sup if side == "RES" else nearest_res
         rr = None
         if opposite is not None:
             reward = abs(zone["price"] - opposite["price"]) / current_price * 100
-            risk = STOP_BUFFER_PCT + dist          # من السعر الحالي إلى ما بعد المستوى
+            risk = STOP_BUFFER_PCT + dist
             rr = reward / risk if risk > 0 else 0
             if rr < MIN_RR:
-                log.info(f"{symbol}: R:R ضعيف ({rr:.2f}) - تجاهل تنبيه الدخول")
+                log.info(f"{symbol}: R:R ضعيف ({rr:.2f}) - تجاهل دخول")
                 return
 
         if should_alert(symbol, side, zone["price"], "ENTRY", COOLDOWN_ENTRY):
-            msg = build_message("ENTRY", symbol, label, zone,
-                                current_price, dist, range_width, rr)
-            send_telegram(msg)
-            log.info(f"ENTRY alert: {symbol} {label} @ {zone['price']:.4f} "
+            send_telegram(build_message("ENTRY", symbol, label, zone,
+                                        current_price, dist, range_width, rr))
+            log.info(f"ENTRY: {symbol} {label} @ {zone['price']:.4f} "
                      f"dist={dist:.2f}% rr={rr}")
         return
 
-    # ============ المسار 2: إنذار مبكر ============
+    # ---- إنذار مبكر ----
     if dist <= EARLY_PCT:
         if should_alert(symbol, side, zone["price"], "EARLY", COOLDOWN_EARLY):
-            msg = build_message("EARLY", symbol, label, zone,
-                                current_price, dist, range_width, None)
-            send_telegram(msg)
-            log.info(f"EARLY alert: {symbol} {label} @ {zone['price']:.4f} "
-                     f"dist={dist:.2f}%")
+            send_telegram(build_message("EARLY", symbol, label, zone,
+                                        current_price, dist, range_width, None))
+            log.info(f"EARLY: {symbol} {label} @ {zone['price']:.4f} dist={dist:.2f}%")
 
-# ================== خادم صحي لـ Render ==================
+# ================== Health Check (GET + HEAD) ==================
 class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
+    def _send_headers(self):
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Connection", "close")
         self.end_headers()
+
+    def do_GET(self):
+        self._send_headers()
         self.wfile.write(b"OK")
+
+    def do_HEAD(self):
+        self._send_headers()
+
     def log_message(self, *args, **kwargs):
-        pass
+        pass  # كتم سجلات HTTP المزعجة
 
 def run_health_server():
     port = int(os.environ.get("PORT", "10000"))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    log.info(f"Health server on port {port}")
+    log.info(f"Health server listening on 0.0.0.0:{port} (GET+HEAD)")
     server.serve_forever()
 
 # ================== الحلقة الرئيسية ==================
 def main_loop():
-    send_telegram("✅ البوت بدأ العمل (نسخة بمساري التنبيه)")
+    send_telegram("✅ البوت بدأ العمل (نسخة SQLite + HEAD)")
     log.info(f"Bot started | symbols={SYMBOLS} tf={TIMEFRAME} "
-             f"entry={ENTRY_PCT}% early={EARLY_PCT}%")
+             f"entry={ENTRY_PCT}% early={EARLY_PCT}% db={DB_PATH}")
 
     while True:
         for symbol in SYMBOLS:
@@ -265,5 +287,6 @@ def main_loop():
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
+    init_db()
     threading.Thread(target=run_health_server, daemon=True).start()
     main_loop()
