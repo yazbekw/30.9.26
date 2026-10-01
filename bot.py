@@ -2,6 +2,8 @@ import os
 import time
 import sqlite3
 import logging
+from datetime import datetime
+import zoneinfo
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 import requests
@@ -16,11 +18,14 @@ log = logging.getLogger("signals")
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-SYMBOLS = [s.strip().upper() for s in os.environ.get(
-    "SYMBOLS",
+_default_symbols = (
     "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,"
     "ADAUSDT,AVAXUSDT,LINKUSDT,DOGEUSDT,SUIUSDT"
-).split(",") if s.strip()]
+)
+_raw_symbols = os.environ.get("SYMBOLS", "").strip()
+SYMBOLS = [s.strip().upper() for s in (_raw_symbols or _default_symbols).split(",") if s.strip()]
+
+TIMEZONE = os.environ.get("TIMEZONE", "Asia/Damascus")
 
 TIMEFRAME         = os.environ.get("TIMEFRAME", "1h")
 CONFIRM_TIMEFRAME = os.environ.get("CONFIRM_TIMEFRAME", "5m")
@@ -36,6 +41,9 @@ EARLY_PCT         = float(os.environ.get("EARLY_PCT", "2.5"))
 MIN_RANGE_WIDTH   = float(os.environ.get("MIN_RANGE_WIDTH", "1.5"))
 MIN_RR            = float(os.environ.get("MIN_RR", "1.3"))
 STOP_BUFFER_PCT   = float(os.environ.get("STOP_BUFFER_PCT", "0.6"))
+
+# تشغيل/إيقاف الإنذار المبكر
+USE_EARLY_ALERT   = os.environ.get("USE_EARLY_ALERT", "true").lower() == "true"
 
 # فلتر ADX
 USE_ADX_FILTER    = os.environ.get("USE_ADX_FILTER", "true").lower() == "true"
@@ -55,6 +63,22 @@ COOLDOWN_ENTRY    = int(os.environ.get("COOLDOWN_ENTRY", "3600"))
 
 DB_PATH = os.environ.get("DB_PATH", "alerts.db")
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
+
+# ================== التوقيت المحلي ==================
+def _tz():
+    try:
+        return zoneinfo.ZoneInfo(TIMEZONE)
+    except Exception:
+        return zoneinfo.ZoneInfo("UTC")
+
+def local_now_str():
+    return datetime.now(_tz()).strftime("%Y-%m-%d %H:%M:%S")
+
+def ms_to_local_str(ms):
+    try:
+        return datetime.fromtimestamp(ms / 1000, tz=_tz()).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "—"
 
 # ================== قاعدة البيانات ==================
 def init_db():
@@ -195,7 +219,6 @@ def volume_profile(candles, buckets=60):
     return poc, vah, val
 
 def merge_vp_into_zones(zones, vp_levels, tolerance_pct):
-    """vp_levels: [{'price':..., 'source':'POC'}, ...]"""
     for vp in vp_levels:
         merged = False
         for z in zones:
@@ -265,7 +288,7 @@ def check_rejection_5m(symbol, side, level, proximity_pct=0.6):
     if len(candles) < 3:
         return False, "بيانات غير كافية"
 
-    last = candles[-2]   # آخر شمعة مغلقة
+    last = candles[-2]
     prev = candles[-3]
 
     body = abs(last["close"] - last["open"])
@@ -316,6 +339,7 @@ def build_message(alert_type, symbol, label, zone, current_price, dist,
 
     lines = [
         header,
+        f"🕐 <b>الوقت:</b> {local_now_str()} ({TIMEZONE})",
         "",
         f"<b>العملة:</b> {symbol}",
         f"<b>النوع:</b> {label}",
@@ -326,6 +350,10 @@ def build_message(alert_type, symbol, label, zone, current_price, dist,
         f"<b>المسافة:</b> {dist:.2f}%",
         f"<b>عدد اللمسات:</b> {zone['touches']}",
     ]
+
+    if zone.get("last_time"):
+        lines.append(f"<b>آخر لمسة للمستوى:</b> {ms_to_local_str(zone['last_time'])}")
+
     if adx is not None:
         lines.append(f"<b>ADX:</b> {adx:.1f}")
     if range_width is not None:
@@ -335,8 +363,6 @@ def build_message(alert_type, symbol, label, zone, current_price, dist,
     if confirm_text:
         lines.append("")
         lines.append(f"<b>تأكيد {CONFIRM_TIMEFRAME}:</b> {confirm_text}")
-        if confirm_reason:
-            lines.append(f"<i>{confirm_reason}</i>")
     return "\n".join(lines)
 
 # ================== منطق الفحص ==================
@@ -347,12 +373,10 @@ def check_symbol(symbol):
 
     current_price = candles[-1]["close"]
 
-    # 1) محاور السعر
     highs, lows = find_pivots(candles, PIVOT_LEFT, PIVOT_RIGHT)
     res_zones = cluster_levels(highs, CLUSTER_TOLERANCE)
     sup_zones = cluster_levels(lows,  CLUSTER_TOLERANCE)
 
-    # 2) Volume Profile POC/VAH/VAL
     if USE_VOLUME_PROFILE:
         poc, vah, val = volume_profile(candles, VP_BUCKETS)
         vp_levels = []
@@ -362,7 +386,6 @@ def check_symbol(symbol):
         res_zones = merge_vp_into_zones(res_zones, vp_levels, CLUSTER_TOLERANCE)
         sup_zones = merge_vp_into_zones(sup_zones, vp_levels, CLUSTER_TOLERANCE)
 
-    # 3) فلترة حسب السعر الحالي
     res_zones = [z for z in res_zones
                  if z["touches"] >= MIN_TOUCHES and z["price"] > current_price]
     sup_zones = [z for z in sup_zones
@@ -386,22 +409,18 @@ def check_symbol(symbol):
     if nearest_res and nearest_sup:
         range_width = (nearest_res["price"] - nearest_sup["price"]) / current_price * 100
 
-    # ========= ADX =========
     adx_val = calc_adx(candles[-100:], ADX_PERIOD) if USE_ADX_FILTER else None
 
     # ========= المسار 1: تنبيه دخول =========
     if dist <= ENTRY_PCT:
-        # فلتر النطاق
         if range_width is not None and range_width < MIN_RANGE_WIDTH:
             log.info(f"{symbol}: نطاق ضيق ({range_width:.2f}%) - تجاهل")
             return
 
-        # فلتر ADX
         if USE_ADX_FILTER and adx_val is not None and adx_val > ADX_MAX_FOR_ENTRY:
             log.info(f"{symbol}: ADX مرتفع ({adx_val:.1f}) - ترند قوي، تجاهل")
             return
 
-        # حساب R:R
         opposite = nearest_sup if side == "RES" else nearest_res
         rr = None
         if opposite is not None:
@@ -412,7 +431,6 @@ def check_symbol(symbol):
                 log.info(f"{symbol}: R:R ضعيف ({rr:.2f}) - تجاهل")
                 return
 
-        # تأكيد 5 دقائق
         confirm_reason = None
         if USE_5M_CONFIRM:
             ok, confirm_reason = check_rejection_5m(symbol, side, zone["price"])
@@ -423,15 +441,14 @@ def check_symbol(symbol):
         if should_alert(symbol, side, zone["price"], "ENTRY", COOLDOWN_ENTRY):
             msg = build_message("ENTRY", symbol, label, zone, current_price,
                                 dist, range_width, rr, adx_val,
-                                confirm_text=f"✅ {confirm_reason}" if confirm_reason else None,
-                                confirm_reason=None)
+                                confirm_text=f"✅ {confirm_reason}" if confirm_reason else None)
             send_telegram(msg)
             log.info(f"ENTRY: {symbol} {label} @ {zone['price']:.4f} "
                      f"dist={dist:.2f}% rr={rr} adx={adx_val} conf={confirm_reason}")
         return
 
     # ========= المسار 2: إنذار مبكر =========
-    if dist <= EARLY_PCT:
+    if USE_EARLY_ALERT and dist <= EARLY_PCT:
         if should_alert(symbol, side, zone["price"], "EARLY", COOLDOWN_EARLY):
             msg = build_message("EARLY", symbol, label, zone, current_price,
                                 dist, range_width, None, adx_val)
@@ -466,14 +483,16 @@ def run_health_server():
 # ================== الحلقة الرئيسية ==================
 def main_loop():
     send_telegram(
-        "✅ البوت بدأ العمل\n"
+        f"✅ البوت بدأ العمل\n"
+        f"🕐 {local_now_str()} ({TIMEZONE})\n"
         f"العملات: {len(SYMBOLS)}\n"
         f"ADX Filter: {USE_ADX_FILTER} (max {ADX_MAX_FOR_ENTRY})\n"
         f"تأكيد {CONFIRM_TIMEFRAME}: {USE_5M_CONFIRM}\n"
-        f"Volume Profile: {USE_VOLUME_PROFILE}"
+        f"Volume Profile: {USE_VOLUME_PROFILE}\n"
+        f"الإنذار المبكر: {USE_EARLY_ALERT}"
     )
     log.info(f"Bot started | symbols={len(SYMBOLS)} tf={TIMEFRAME} "
-             f"adx_filter={USE_ADX_FILTER} 5m_confirm={USE_5M_CONFIRM}")
+             f"tz={TIMEZONE} early={USE_EARLY_ALERT}")
 
     while True:
         for symbol in SYMBOLS:
