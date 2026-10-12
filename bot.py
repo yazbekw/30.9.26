@@ -1,508 +1,360 @@
-import os
-import time
-import sqlite3
-import logging
-from datetime import datetime
-import zoneinfo
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import threading
+"""
+لوحة تحليل العملات الرقمية الاحترافية
+- رسمان بيانيان جنباً إلى جنب لعملتين مختلفتين
+- مؤشرات: SMA, EMA, Bollinger, VWAP, S/R, Fibonacci, Pivot, Volume, RSI, MACD
+- تحديث تلقائي كل 5 ثوانٍ
+"""
+import streamlit as st
+import pandas as pd
+import numpy as np
 import requests
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+# ============ إعدادات الصفحة ============
+st.set_page_config(
+    page_title="لوحة تحليل العملات الرقمية",
+    layout="wide",
+    page_icon="📊",
+    initial_sidebar_state="collapsed",
 )
-log = logging.getLogger("signals")
 
-# ================== الإعدادات ==================
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+# ============ ثوابت ============
+# XAU لا يوجد على Binance مباشرة، نستخدم PAXG (مدعوم بالذهب الفعلي 1:1)
+SYMBOLS = {
+    "BTC (بيتكوين)":       "BTCUSDT",
+    "ETH (إيثيريوم)":       "ETHUSDT",
+    "BNB (بينانس)":         "BNBUSDT",
+    "SOL (سولانا)":         "SOLUSDT",
+    "XRP (ريبل)":           "XRPUSDT",
+    "DOGE (دوجكوين)":       "DOGEUSDT",
+    "XAU (الذهب/PAXG)":     "PAXGUSDT",
+}
 
-_default_symbols = (
-    "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,"
-    "ADAUSDT,AVAXUSDT,LINKUSDT,DOGEUSDT,SUIUSDT"
-)
-_raw_symbols = os.environ.get("SYMBOLS", "").strip()
-SYMBOLS = [s.strip().upper() for s in (_raw_symbols or _default_symbols).split(",") if s.strip()]
+ALL_INDICATORS = [
+    "SMA (متوسط بسيط)",
+    "EMA (متوسط أسّي)",
+    "Bollinger Bands",
+    "VWAP",
+    "الدعم والمقاومة",
+    "Fibonacci Retracement",
+    "Pivot Points",
+    "Volume (الحجم)",
+    "RSI",
+    "MACD",
+]
 
-TIMEZONE = os.environ.get("TIMEZONE", "Asia/Damascus")
+DEFAULT_ON = {"SMA (متوسط بسيط)", "Bollinger Bands", "الدعم والمقاومة", "RSI", "Volume (الحجم)"}
 
-TIMEFRAME         = os.environ.get("TIMEFRAME", "1h")
-CONFIRM_TIMEFRAME = os.environ.get("CONFIRM_TIMEFRAME", "5m")
-CHECK_INTERVAL    = int(os.environ.get("CHECK_INTERVAL", "300"))
-
-PIVOT_LEFT        = int(os.environ.get("PIVOT_LEFT", "5"))
-PIVOT_RIGHT       = int(os.environ.get("PIVOT_RIGHT", "5"))
-CLUSTER_TOLERANCE = float(os.environ.get("CLUSTER_TOLERANCE", "0.6"))
-MIN_TOUCHES       = int(os.environ.get("MIN_TOUCHES", "2"))
-
-ENTRY_PCT         = float(os.environ.get("ENTRY_PCT", "0.8"))
-EARLY_PCT         = float(os.environ.get("EARLY_PCT", "2.5"))
-MIN_RANGE_WIDTH   = float(os.environ.get("MIN_RANGE_WIDTH", "1.5"))
-MIN_RR            = float(os.environ.get("MIN_RR", "1.3"))
-STOP_BUFFER_PCT   = float(os.environ.get("STOP_BUFFER_PCT", "0.6"))
-
-# تشغيل/إيقاف الإنذار المبكر
-USE_EARLY_ALERT   = os.environ.get("USE_EARLY_ALERT", "true").lower() == "true"
-
-# فلتر ADX
-USE_ADX_FILTER    = os.environ.get("USE_ADX_FILTER", "true").lower() == "true"
-ADX_PERIOD        = int(os.environ.get("ADX_PERIOD", "14"))
-ADX_MAX_FOR_ENTRY = float(os.environ.get("ADX_MAX_FOR_ENTRY", "25"))
-
-# تأكيد 5 دقائق
-USE_5M_CONFIRM    = os.environ.get("USE_5M_CONFIRM", "true").lower() == "true"
-WICK_BODY_RATIO   = float(os.environ.get("WICK_BODY_RATIO", "1.5"))
-
-# Volume Profile
-USE_VOLUME_PROFILE = os.environ.get("USE_VOLUME_PROFILE", "true").lower() == "true"
-VP_BUCKETS         = int(os.environ.get("VP_BUCKETS", "60"))
-
-COOLDOWN_EARLY    = int(os.environ.get("COOLDOWN_EARLY", "7200"))
-COOLDOWN_ENTRY    = int(os.environ.get("COOLDOWN_ENTRY", "3600"))
-
-DB_PATH = os.environ.get("DB_PATH", "alerts.db")
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
-
-# ================== التوقيت المحلي ==================
-def _tz():
-    try:
-        return zoneinfo.ZoneInfo(TIMEZONE)
-    except Exception:
-        return zoneinfo.ZoneInfo("UTC")
-
-def local_now_str():
-    return datetime.now(_tz()).strftime("%Y-%m-%d %H:%M:%S")
-
-def ms_to_local_str(ms):
-    try:
-        return datetime.fromtimestamp(ms / 1000, tz=_tz()).strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        return "—"
-
-# ================== قاعدة البيانات ==================
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS alert_state (
-            symbol     TEXT NOT NULL,
-            kind       TEXT NOT NULL,
-            level      REAL NOT NULL,
-            alert_type TEXT NOT NULL,
-            last_ts    REAL NOT NULL,
-            PRIMARY KEY (symbol, kind, level, alert_type)
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-def get_last_alert(symbol, kind, level, alert_type):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.execute(
-        "SELECT last_ts FROM alert_state "
-        "WHERE symbol=? AND kind=? AND level=? AND alert_type=?",
-        (symbol, kind, round(level, 2), alert_type)
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else 0.0
-
-def set_last_alert(symbol, kind, level, alert_type, ts):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "INSERT OR REPLACE INTO alert_state "
-        "(symbol, kind, level, alert_type, last_ts) VALUES (?, ?, ?, ?, ?)",
-        (symbol, kind, round(level, 2), alert_type, ts)
-    )
-    conn.commit()
-    conn.close()
-
-def should_alert(symbol, kind, level, alert_type, cooldown):
-    now = time.time()
-    if now - get_last_alert(symbol, kind, level, alert_type) < cooldown:
-        return False
-    set_last_alert(symbol, kind, level, alert_type, now)
-    return True
-
-# ================== Binance ==================
-def fetch_klines(symbol, interval="1h", limit=300):
+# ============ جلب البيانات ============
+@st.cache_data(ttl=4, show_spinner=False)
+def fetch_klines(symbol: str, interval: str = "1m", limit: int = 400) -> pd.DataFrame:
+    url = f"https://api.binance.com/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(BINANCE_URL, params=params, timeout=15)
+    r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
-    return [{
-        "time":   k[0],
-        "open":   float(k[1]),
-        "high":   float(k[2]),
-        "low":    float(k[3]),
-        "close":  float(k[4]),
-        "volume": float(k[5]),
-    } for k in r.json()]
+    data = r.json()
+    df = pd.DataFrame(data, columns=[
+        "time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades",
+        "taker_buy_base", "taker_buy_quote", "ignore",
+    ])
+    df["time"] = pd.to_datetime(df["time"], unit="ms")
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = df[c].astype(float)
+    return df[["time", "open", "high", "low", "close", "volume"]]
 
-# ================== اكتشاف القمم والقيعان ==================
-def find_pivots(candles, left, right):
-    highs, lows = [], []
-    for i in range(left, len(candles) - right):
-        c = candles[i]
-        window = candles[i - left:i] + candles[i + 1:i + right + 1]
-        if all(c["high"] > x["high"] for x in window):
-            highs.append({"price": c["high"], "time": c["time"]})
-        if all(c["low"] < x["low"] for x in window):
-            lows.append({"price": c["low"], "time": c["time"]})
-    return highs, lows
 
-def cluster_levels(levels, tolerance_pct):
-    if not levels:
-        return []
-    levels = sorted(levels, key=lambda x: x["price"])
-    clusters = [[levels[0]]]
-    for lvl in levels[1:]:
-        cur = clusters[-1]
-        avg = sum(x["price"] for x in cur) / len(cur)
-        if abs(lvl["price"] - avg) / avg * 100 <= tolerance_pct:
-            cur.append(lvl)
-        else:
-            clusters.append([lvl])
-    return [{
-        "price":     sum(x["price"] for x in cl) / len(cl),
-        "touches":   len(cl),
-        "last_time": max(x["time"] for x in cl),
-        "source":    "pivot",
-    } for cl in clusters]
+@st.cache_data(ttl=4, show_spinner=False)
+def fetch_ticker(symbol: str) -> dict:
+    url = f"https://api.binance.com/api/v3/ticker/24hr"
+    r = requests.get(url, params={"symbol": symbol}, timeout=10)
+    return r.json()
 
-# ================== Volume Profile ==================
-def volume_profile(candles, buckets=60):
-    if not candles:
-        return None, None, None
-    pmin = min(c["low"] for c in candles)
-    pmax = max(c["high"] for c in candles)
-    if pmax <= pmin:
-        return None, None, None
 
-    step = (pmax - pmin) / buckets
-    vol = [0.0] * buckets
+# ============ حساب المؤشرات ============
+def sma(s, p):  return s.rolling(p).mean()
+def ema(s, p):  return s.ewm(span=p, adjust=False).mean()
 
-    for c in candles:
-        lo, hi, v = c["low"], c["high"], c["volume"]
-        if hi <= lo or v <= 0:
-            idx = min(max(int((c["close"] - pmin) / step), 0), buckets - 1)
-            vol[idx] += v
-            continue
-        b_start = max(int((lo - pmin) / step), 0)
-        b_end   = min(int((hi - pmin) / step), buckets - 1)
-        span = max(b_end - b_start + 1, 1)
-        per = v / span
-        for b in range(b_start, b_end + 1):
-            vol[b] += per
 
-    poc_idx = max(range(buckets), key=lambda i: vol[i])
-    poc = pmin + (poc_idx + 0.5) * step
+def bollinger(s, period=20, k=2):
+    m = s.rolling(period).mean()
+    sd = s.rolling(period).std()
+    return m + k * sd, m, m - k * sd
 
-    total = sum(vol)
-    target = total * 0.7
-    included = {poc_idx}
-    acc = vol[poc_idx]
-    left, right = poc_idx - 1, poc_idx + 1
-    while acc < target and (left >= 0 or right < buckets):
-        lv = vol[left] if left >= 0 else -1
-        rv = vol[right] if right < buckets else -1
-        if rv >= lv and right < buckets:
-            included.add(right); acc += vol[right]; right += 1
-        elif left >= 0:
-            included.add(left); acc += vol[left]; left -= 1
-        elif right < buckets:
-            included.add(right); acc += vol[right]; right += 1
-        else:
-            break
 
-    vah = pmin + (max(included) + 1) * step
-    val = pmin + min(included) * step
-    return poc, vah, val
+def rsi(s, period=14):
+    delta = s.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
 
-def merge_vp_into_zones(zones, vp_levels, tolerance_pct):
-    for vp in vp_levels:
-        merged = False
-        for z in zones:
-            if abs(z["price"] - vp["price"]) / z["price"] * 100 <= tolerance_pct:
-                z["touches"] += 1
-                z["source"] = z.get("source", "pivot") + "+" + vp["source"]
-                merged = True
-                break
-        if not merged:
-            zones.append({
-                "price":     vp["price"],
-                "touches":   max(MIN_TOUCHES, 2),
-                "last_time": 0,
-                "source":    vp["source"],
-            })
-    return zones
 
-# ================== ADX ==================
-def calc_adx(candles, period=14):
-    if len(candles) < period * 2 + 2:
-        return None
-    trs, pdms, mdms = [], [], []
-    for i in range(1, len(candles)):
-        h, l = candles[i]["high"], candles[i]["low"]
-        ph, pl, pc = candles[i-1]["high"], candles[i-1]["low"], candles[i-1]["close"]
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        up = h - ph
-        dn = pl - l
-        pdm = up if (up > dn and up > 0) else 0.0
-        mdm = dn if (dn > up and dn > 0) else 0.0
-        trs.append(tr); pdms.append(pdm); mdms.append(mdm)
+def macd(s, fast=12, slow=26, signal=9):
+    line = ema(s, fast) - ema(s, slow)
+    sig = ema(line, signal)
+    return line, sig, line - sig
 
-    def wilder(vals, n):
-        out = [sum(vals[:n])]
-        for v in vals[n:]:
-            out.append(out[-1] - out[-1] / n + v)
-        return out
 
-    atr = wilder(trs, period)
-    pdm_s = wilder(pdms, period)
-    mdm_s = wilder(mdms, period)
+def vwap(df):
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    return (tp * df["volume"]).cumsum() / df["volume"].cumsum()
 
-    dxs = []
-    for a, p, m in zip(atr, pdm_s, mdm_s):
-        if a == 0:
-            dxs.append(0.0); continue
-        pdi = 100 * p / a
-        mdi = 100 * m / a
-        denom = pdi + mdi
-        dxs.append(100 * abs(pdi - mdi) / denom if denom > 0 else 0.0)
 
-    if len(dxs) < period:
-        return None
-    adx = sum(dxs[:period]) / period
-    for dx in dxs[period:]:
-        adx = (adx * (period - 1) + dx) / period
-    return adx
+def support_resistance(df, lookback=60):
+    recent = df.tail(lookback)
+    return float(recent["low"].min()), float(recent["high"].max())
 
-# ================== تأكيد 5 دقائق ==================
-def check_rejection_5m(symbol, side, level, proximity_pct=0.6):
-    try:
-        candles = fetch_klines(symbol, CONFIRM_TIMEFRAME, 20)
-    except Exception as e:
-        log.warning(f"{symbol}: فشل جلب {CONFIRM_TIMEFRAME}: {e}")
-        return False, "فشل جلب البيانات"
 
-    if len(candles) < 3:
-        return False, "بيانات غير كافية"
-
-    last = candles[-2]
-    prev = candles[-3]
-
-    body = abs(last["close"] - last["open"])
-    upper_wick = last["high"] - max(last["open"], last["close"])
-    lower_wick = min(last["open"], last["close"]) - last["low"]
-
-    touched = (last["low"] <= level <= last["high"]) or \
-              (abs(last["close"] - level) / level * 100 <= proximity_pct)
-    if not touched:
-        return False, "لم تلمس الشمعة المستوى"
-
-    if side == "RES":
-        if body > 0 and upper_wick / body >= WICK_BODY_RATIO and last["close"] < last["open"]:
-            return True, "Pin Bar هابطة (ظل علوي طويل)"
-        if (last["close"] < last["open"] and prev["close"] > prev["open"]
-                and last["open"] >= prev["close"] and last["close"] <= prev["open"]):
-            return True, "Bearish Engulfing"
-    else:
-        if body > 0 and lower_wick / body >= WICK_BODY_RATIO and last["close"] > last["open"]:
-            return True, "Pin Bar صاعدة (ظل سفلي طويل)"
-        if (last["close"] > last["open"] and prev["close"] < prev["open"]
-                and last["open"] <= prev["close"] and last["close"] >= prev["open"]):
-            return True, "Bullish Engulfing"
-
-    return False, "لا يوجد نمط رفض"
-
-# ================== تلغرام ==================
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
+def fib_levels(df, lookback=120):
+    recent = df.tail(lookback)
+    hi, lo = float(recent["high"].max()), float(recent["low"].min())
+    diff = hi - lo
+    return {
+        "0.0%":   hi,
+        "23.6%":  hi - 0.236 * diff,
+        "38.2%":  hi - 0.382 * diff,
+        "50.0%":  hi - 0.500 * diff,
+        "61.8%":  hi - 0.618 * diff,
+        "78.6%":  hi - 0.786 * diff,
+        "100%":   lo,
     }
-    try:
-        r = requests.post(url, json=payload, timeout=15)
-        if r.status_code != 200:
-            log.warning(f"Telegram error {r.status_code}: {r.text}")
-    except Exception as e:
-        log.exception(f"Telegram exception: {e}")
 
-# ================== بناء الرسالة ==================
-def build_message(alert_type, symbol, label, zone, current_price, dist,
-                  range_width=None, rr=None, adx=None,
-                  confirm_text=None, confirm_reason=None):
-    header = "🚨 <b>تنبيه دخول</b>" if alert_type == "ENTRY" else "⏳ <b>إنذار مبكر</b>"
 
-    lines = [
-        header,
-        f"🕐 <b>الوقت:</b> {local_now_str()} ({TIMEZONE})",
-        "",
-        f"<b>العملة:</b> {symbol}",
-        f"<b>النوع:</b> {label}",
-        f"<b>الإطار:</b> {TIMEFRAME}",
-        f"<b>المستوى:</b> {zone['price']:.4f}",
-        f"<b>المصدر:</b> {zone.get('source', 'pivot')}",
-        f"<b>السعر الحالي:</b> {current_price:.4f}",
-        f"<b>المسافة:</b> {dist:.2f}%",
-        f"<b>عدد اللمسات:</b> {zone['touches']}",
-    ]
+def pivot_points(df):
+    d = df.copy()
+    d["date"] = d["time"].dt.date
+    daily = d.groupby("date").agg({"high": "max", "low": "min", "close": "last"}).reset_index()
+    daily["P"]  = (daily["high"] + daily["low"] + daily["close"]) / 3
+    daily["R1"] = 2 * daily["P"] - daily["low"]
+    daily["S1"] = 2 * daily["P"] - daily["high"]
+    daily["R2"] = daily["P"] + (daily["high"] - daily["low"])
+    daily["S2"] = daily["P"] - (daily["high"] - daily["low"])
+    daily["R3"] = daily["high"] + 2 * (daily["P"] - daily["low"])
+    daily["S3"] = daily["low"]  - 2 * (daily["high"] - daily["P"])
+    return daily
 
-    if zone.get("last_time"):
-        lines.append(f"<b>آخر لمسة للمستوى:</b> {ms_to_local_str(zone['last_time'])}")
 
-    if adx is not None:
-        lines.append(f"<b>ADX:</b> {adx:.1f}")
-    if range_width is not None:
-        lines.append(f"<b>عرض النطاق:</b> {range_width:.2f}%")
-    if rr is not None:
-        lines.append(f"<b>R:R المتوقع:</b> {rr:.2f}")
-    if confirm_text:
-        lines.append("")
-        lines.append(f"<b>تأكيد {CONFIRM_TIMEFRAME}:</b> {confirm_text}")
-    return "\n".join(lines)
+# ============ بناء الرسم البياني ============
+def build_chart(df: pd.DataFrame, title: str, indicators: set) -> go.Figure:
+    show_rsi  = "RSI" in indicators
+    show_macd = "MACD" in indicators
 
-# ================== منطق الفحص ==================
-def check_symbol(symbol):
-    candles = fetch_klines(symbol, TIMEFRAME, 300)
-    if len(candles) < 50:
-        return
+    # تقسيم الصفوف
+    rows = 1
+    heights = [0.70]
+    if show_rsi:
+        rows += 1; heights.append(0.15)
+    if show_macd:
+        rows += 1; heights.append(0.15)
+    total = sum(heights)
+    heights = [h / total for h in heights]
 
-    current_price = candles[-1]["close"]
-
-    highs, lows = find_pivots(candles, PIVOT_LEFT, PIVOT_RIGHT)
-    res_zones = cluster_levels(highs, CLUSTER_TOLERANCE)
-    sup_zones = cluster_levels(lows,  CLUSTER_TOLERANCE)
-
-    if USE_VOLUME_PROFILE:
-        poc, vah, val = volume_profile(candles, VP_BUCKETS)
-        vp_levels = []
-        if poc: vp_levels.append({"price": poc, "source": "POC"})
-        if vah: vp_levels.append({"price": vah, "source": "VAH"})
-        if val: vp_levels.append({"price": val, "source": "VAL"})
-        res_zones = merge_vp_into_zones(res_zones, vp_levels, CLUSTER_TOLERANCE)
-        sup_zones = merge_vp_into_zones(sup_zones, vp_levels, CLUSTER_TOLERANCE)
-
-    res_zones = [z for z in res_zones
-                 if z["touches"] >= MIN_TOUCHES and z["price"] > current_price]
-    sup_zones = [z for z in sup_zones
-                 if z["touches"] >= MIN_TOUCHES and z["price"] < current_price]
-
-    nearest_res = min(res_zones, key=lambda z: z["price"] - current_price) if res_zones else None
-    nearest_sup = max(sup_zones, key=lambda z: z["price"]) if sup_zones else None
-
-    res_dist = (nearest_res["price"] - current_price) / current_price * 100 if nearest_res else 999.0
-    sup_dist = (current_price - nearest_sup["price"]) / current_price * 100 if nearest_sup else 999.0
-
-    if res_dist <= sup_dist:
-        side, label, zone, dist = "RES", "🟥 مقاومة", nearest_res, res_dist
-    else:
-        side, label, zone, dist = "SUP", "🟩 دعم", nearest_sup, sup_dist
-
-    if zone is None:
-        return
-
-    range_width = None
-    if nearest_res and nearest_sup:
-        range_width = (nearest_res["price"] - nearest_sup["price"]) / current_price * 100
-
-    adx_val = calc_adx(candles[-100:], ADX_PERIOD) if USE_ADX_FILTER else None
-
-    # ========= المسار 1: تنبيه دخول =========
-    if dist <= ENTRY_PCT:
-        if range_width is not None and range_width < MIN_RANGE_WIDTH:
-            log.info(f"{symbol}: نطاق ضيق ({range_width:.2f}%) - تجاهل")
-            return
-
-        if USE_ADX_FILTER and adx_val is not None and adx_val > ADX_MAX_FOR_ENTRY:
-            log.info(f"{symbol}: ADX مرتفع ({adx_val:.1f}) - ترند قوي، تجاهل")
-            return
-
-        opposite = nearest_sup if side == "RES" else nearest_res
-        rr = None
-        if opposite is not None:
-            reward = abs(zone["price"] - opposite["price"]) / current_price * 100
-            risk = STOP_BUFFER_PCT + dist
-            rr = reward / risk if risk > 0 else 0
-            if rr < MIN_RR:
-                log.info(f"{symbol}: R:R ضعيف ({rr:.2f}) - تجاهل")
-                return
-
-        confirm_reason = None
-        if USE_5M_CONFIRM:
-            ok, confirm_reason = check_rejection_5m(symbol, side, zone["price"])
-            if not ok:
-                log.info(f"{symbol}: فشل تأكيد {CONFIRM_TIMEFRAME} ({confirm_reason})")
-                return
-
-        if should_alert(symbol, side, zone["price"], "ENTRY", COOLDOWN_ENTRY):
-            msg = build_message("ENTRY", symbol, label, zone, current_price,
-                                dist, range_width, rr, adx_val,
-                                confirm_text=f"✅ {confirm_reason}" if confirm_reason else None)
-            send_telegram(msg)
-            log.info(f"ENTRY: {symbol} {label} @ {zone['price']:.4f} "
-                     f"dist={dist:.2f}% rr={rr} adx={adx_val} conf={confirm_reason}")
-        return
-
-    # ========= المسار 2: إنذار مبكر =========
-    if USE_EARLY_ALERT and dist <= EARLY_PCT:
-        if should_alert(symbol, side, zone["price"], "EARLY", COOLDOWN_EARLY):
-            msg = build_message("EARLY", symbol, label, zone, current_price,
-                                dist, range_width, None, adx_val)
-            send_telegram(msg)
-            log.info(f"EARLY: {symbol} {label} @ {zone['price']:.4f} dist={dist:.2f}%")
-
-# ================== Health Check ==================
-class HealthHandler(BaseHTTPRequestHandler):
-    def _headers(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
-        self.send_header("Connection", "close")
-        self.end_headers()
-
-    def do_GET(self):
-        self._headers()
-        self.wfile.write(b"OK")
-
-    def do_HEAD(self):
-        self._headers()
-
-    def log_message(self, *args, **kwargs):
-        pass
-
-def run_health_server():
-    port = int(os.environ.get("PORT", "10000"))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    log.info(f"Health server on 0.0.0.0:{port} (GET+HEAD)")
-    server.serve_forever()
-
-# ================== الحلقة الرئيسية ==================
-def main_loop():
-    send_telegram(
-        f"✅ البوت بدأ العمل\n"
-        f"🕐 {local_now_str()} ({TIMEZONE})\n"
-        f"العملات: {len(SYMBOLS)}\n"
-        f"ADX Filter: {USE_ADX_FILTER} (max {ADX_MAX_FOR_ENTRY})\n"
-        f"تأكيد {CONFIRM_TIMEFRAME}: {USE_5M_CONFIRM}\n"
-        f"Volume Profile: {USE_VOLUME_PROFILE}\n"
-        f"الإنذار المبكر: {USE_EARLY_ALERT}"
+    fig = make_subplots(
+        rows=rows, cols=1, shared_xaxes=True,
+        vertical_spacing=0.03, row_heights=heights,
     )
-    log.info(f"Bot started | symbols={len(SYMBOLS)} tf={TIMEFRAME} "
-             f"tz={TIMEZONE} early={USE_EARLY_ALERT}")
 
-    while True:
-        for symbol in SYMBOLS:
-            try:
-                check_symbol(symbol)
-            except Exception as e:
-                log.exception(f"Error on {symbol}: {e}")
-        time.sleep(CHECK_INTERVAL)
+    # --- شموع ---
+    fig.add_trace(go.Candlestick(
+        x=df["time"], open=df["open"], high=df["high"],
+        low=df["low"], close=df["close"], name="Price",
+        increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+    ), row=1, col=1)
 
-if __name__ == "__main__":
-    init_db()
-    threading.Thread(target=run_health_server, daemon=True).start()
-    main_loop()
+    # --- SMA ---
+    if "SMA (متوسط بسيط)" in indicators:
+        fig.add_trace(go.Scatter(x=df["time"], y=sma(df["close"], 20),
+                                 name="SMA 20", line=dict(color="#ffeb3b", width=1.2)),
+                      row=1, col=1)
+        fig.add_trace(go.Scatter(x=df["time"], y=sma(df["close"], 50),
+                                 name="SMA 50", line=dict(color="#ff9800", width=1.2)),
+                      row=1, col=1)
+
+    # --- EMA ---
+    if "EMA (متوسط أسّي)" in indicators:
+        fig.add_trace(go.Scatter(x=df["time"], y=ema(df["close"], 20),
+                                 name="EMA 20", line=dict(color="#00bcd4", width=1.2)),
+                      row=1, col=1)
+        fig.add_trace(go.Scatter(x=df["time"], y=ema(df["close"], 50),
+                                 name="EMA 50", line=dict(color="#9c27b0", width=1.2)),
+                      row=1, col=1)
+
+    # --- Bollinger ---
+    if "Bollinger Bands" in indicators:
+        up, mid, lo = bollinger(df["close"])
+        fig.add_trace(go.Scatter(x=df["time"], y=up, name="BB Upper",
+                                 line=dict(color="rgba(120,150,255,0.6)", width=1)),
+                      row=1, col=1)
+        fig.add_trace(go.Scatter(x=df["time"], y=lo, name="BB Lower",
+                                 line=dict(color="rgba(120,150,255,0.6)", width=1),
+                                 fill="tonexty", fillcolor="rgba(120,150,255,0.07)"),
+                      row=1, col=1)
+
+    # --- VWAP ---
+    if "VWAP" in indicators:
+        fig.add_trace(go.Scatter(x=df["time"], y=vwap(df), name="VWAP",
+                                 line=dict(color="#e91e63", width=1.6)),
+                      row=1, col=1)
+
+    # --- S/R ---
+    if "الدعم والمقاومة" in indicators:
+        s, r = support_resistance(df)
+        fig.add_hline(y=s, line_dash="dash", line_color="#26a69a", line_width=1.5,
+                      annotation_text=f"دعم {s:.4f}", annotation_position="right",
+                      row=1, col=1)
+        fig.add_hline(y=r, line_dash="dash", line_color="#ef5350", line_width=1.5,
+                      annotation_text=f"مقاومة {r:.4f}", annotation_position="right",
+                      row=1, col=1)
+
+    # --- Fibonacci ---
+    if "Fibonacci Retracement" in indicators:
+        fib = fib_levels(df)
+        colors = ["#ef5350", "#ff9800", "#ffeb3b", "#8bc34a",
+                  "#26a69a", "#00bcd4", "#3f51b5"]
+        for (label, val), col in zip(fib.items(), colors):
+            fig.add_hline(y=val, line_dash="dot", line_color=col, opacity=0.5,
+                          annotation_text=f"Fib {label}", annotation_position="left",
+                          row=1, col=1)
+
+    # --- Pivot Points ---
+    if "Pivot Points" in indicators:
+        daily = pivot_points(df)
+        if len(daily) >= 2:
+            prev = daily.iloc[-2]
+            lvls = [("P", "yellow"), ("R1", "#ef5350"), ("R2", "#ef5350"),
+                    ("R3", "#ef5350"), ("S1", "#26a69a"), ("S2", "#26a69a"),
+                    ("S3", "#26a69a")]
+            for name, col in lvls:
+                fig.add_hline(y=prev[name], line_dash="dashdot", line_color=col,
+                              opacity=0.4, annotation_text=f"{name}: {prev[name]:.4f}",
+                              annotation_position="right", row=1, col=1)
+
+    # --- Volume (على محور ثانوي) ---
+    if "Volume (الحجم)" in indicators:
+        vol_colors = ["#26a69a" if c >= o else "#ef5350"
+                      for c, o in zip(df["close"], df["open"])]
+        fig.add_trace(go.Bar(x=df["time"], y=df["volume"], name="Volume",
+                             marker_color=vol_colors, opacity=0.35, yaxis="y2"),
+                      row=1, col=1)
+
+    # --- RSI ---
+    cur = 2
+    if show_rsi:
+        fig.add_trace(go.Scatter(x=df["time"], y=rsi(df["close"]), name="RSI",
+                                 line=dict(color="#ba68c8", width=1.5)),
+                      row=cur, col=1)
+        fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.5, row=cur, col=1)
+        fig.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.5, row=cur, col=1)
+        fig.update_yaxes(range=[0, 100], title_text="RSI", row=cur, col=1)
+        cur += 1
+
+    # --- MACD ---
+    if show_macd:
+        line, sig, hist = macd(df["close"])
+        fig.add_trace(go.Scatter(x=df["time"], y=line, name="MACD",
+                                 line=dict(color="#42a5f5", width=1.4)),
+                      row=cur, col=1)
+        fig.add_trace(go.Scatter(x=df["time"], y=sig, name="Signal",
+                                 line=dict(color="#ffa726", width=1.4)),
+                      row=cur, col=1)
+        fig.add_trace(go.Bar(x=df["time"], y=hist, name="Histogram",
+                             marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in hist],
+                             opacity=0.6),
+                      row=cur, col=1)
+        fig.update_yaxes(title_text="MACD", row=cur, col=1)
+
+    # --- التنسيق النهائي ---
+    fig.update_layout(
+        template="plotly_dark",
+        title=dict(text=title, x=0.5, xanchor="center", font=dict(size=16)),
+        height=720,
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified",
+        margin=dict(l=10, r=10, t=50, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01,
+                    xanchor="right", x=1, font=dict(size=10)),
+        dragmode="pan",
+    )
+    if "Volume (الحجم)" in indicators:
+        fig.update_layout(
+            yaxis2=dict(overlaying="y", side="right", showgrid=False,
+                        range=[0, df["volume"].max() * 4.5],
+                        showticklabels=False)
+        )
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
+    return fig
+
+
+# ============ لوحة عملة واحدة ============
+def render_panel(panel_id: int, default_symbol: str):
+    symbol_label = st.selectbox(
+        f"🔸 اختر العملة — اللوحة {panel_id}",
+        options=list(SYMBOLS.keys()),
+        index=list(SYMBOLS.keys()).index(default_symbol),
+        key=f"symbol_{panel_id}",
+    )
+    symbol_code = SYMBOLS[symbol_label]
+
+    # صفّان من مربعات الاختيار
+    st.markdown("**🔧 المؤشرات**")
+    selected = set()
+    cols = st.columns(5)
+    for i, ind in enumerate(ALL_INDICATORS):
+        with cols[i % 5]:
+            if st.checkbox(
+                ind,
+                value=(ind in DEFAULT_ON),
+                key=f"ind_{panel_id}_{ind}",
+            ):
+                selected.add(ind)
+
+    # --- البيانات ---
+    try:
+        df = fetch_klines(symbol_code, interval="1m", limit=400)
+        ticker = fetch_ticker(symbol_code)
+    except Exception as e:
+        st.error(f"تعذر جلب البيانات: {e}")
+        return
+
+    # --- السعر والتغير ---
+    last_price = float(ticker.get("lastPrice", df["close"].iloc[-1]))
+    change_pct = float(ticker.get("priceChangePercent", 0.0))
+    high_24 = float(ticker.get("highPrice", df["high"].max()))
+    low_24  = float(ticker.get("lowPrice",  df["low"].min()))
+    vol_24  = float(ticker.get("quoteVolume", 0.0))
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("آخر سعر", f"{last_price:,.4f}", f"{change_pct:+.2f}%")
+    m2.metric("أعلى 24س", f"{high_24:,.4f}")
+    m3.metric("أدنى 24س", f"{low_24:,.4f}")
+    m4.metric("حجم 24س (USDT)", f"{vol_24/1e6:,.2f}M")
+
+    # --- الرسم ---
+    fig = build_chart(df, f"{symbol_label}  —  USDT (1m)", selected)
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        key=f"chart_{panel_id}",
+        config={"displaylogo": False, "scrollZoom": True},
+    )
+
+
+# ============ الواجهة الرئيسية (تحديث كل 5 ثوانٍ) ============
+@st.fragment(run_every=5)
+def dashboard():
+    st.markdown(
+        "<h2 style='text-align:center;margin-bottom:0;'>📊 لوحة تحليل العملات الرقمية</h2>"
+        "<p style='text-align:center;color:#888;margin-top:0;'>تحديث تلقائي كل 5 ثوانٍ</p>",
+        unsafe_allow_html=True,
+    )
+    col1, col2 = st.columns(2, gap="medium")
+    with col1:
+        render_panel(1, "BTC (بيتكوين)")
+    with col2:
+        render_panel(2, "ETH (إيثيريوم)")
+
+
+dashboard()
