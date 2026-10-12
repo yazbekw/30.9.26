@@ -20,15 +20,14 @@ st.set_page_config(
 )
 
 # ============ ثوابت ============
-# XAU لا يوجد على Binance مباشرة، نستخدم PAXG (مدعوم بالذهب الفعلي 1:1)
 SYMBOLS = {
-    "BTC (بيتكوين)":       "BTCUSDT",
-    "ETH (إيثيريوم)":       "ETHUSDT",
-    "BNB (بينانس)":         "BNBUSDT",
-    "SOL (سولانا)":         "SOLUSDT",
-    "XRP (ريبل)":           "XRPUSDT",
-    "DOGE (دوجكوين)":       "DOGEUSDT",
-    "XAU (الذهب/PAXG)":     "PAXGUSDT",
+    "BTC (بيتكوين)":   "BTCUSDT",
+    "ETH (إيثيريوم)":   "ETHUSDT",
+    "BNB (بينانس)":     "BNBUSDT",
+    "SOL (سولانا)":     "SOLUSDT",
+    "XRP (ريبل)":       "XRPUSDT",
+    "DOGE (دوجكوين)":   "DOGEUSDT",
+    "XAU (الذهب/PAXG)": "PAXGUSDT",
 }
 
 ALL_INDICATORS = [
@@ -46,10 +45,11 @@ ALL_INDICATORS = [
 
 DEFAULT_ON = {"SMA (متوسط بسيط)", "Bollinger Bands", "الدعم والمقاومة", "RSI", "Volume (الحجم)"}
 
+
 # ============ جلب البيانات ============
 @st.cache_data(ttl=4, show_spinner=False)
 def fetch_klines(symbol: str, interval: str = "1m", limit: int = 400) -> pd.DataFrame:
-    url = f"https://api.binance.com/api/v3/klines"
+    url = "https://api.binance.com/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
@@ -67,14 +67,18 @@ def fetch_klines(symbol: str, interval: str = "1m", limit: int = 400) -> pd.Data
 
 @st.cache_data(ttl=4, show_spinner=False)
 def fetch_ticker(symbol: str) -> dict:
-    url = f"https://api.binance.com/api/v3/ticker/24hr"
+    url = "https://api.binance.com/api/v3/ticker/24hr"
     r = requests.get(url, params={"symbol": symbol}, timeout=10)
     return r.json()
 
 
-# ============ حساب المؤشرات ============
-def sma(s, p):  return s.rolling(p).mean()
-def ema(s, p):  return s.ewm(span=p, adjust=False).mean()
+# ============ المؤشرات ============
+def sma(s, p):
+    return s.rolling(p).mean()
+
+
+def ema(s, p):
+    return s.ewm(span=p, adjust=False).mean()
 
 
 def bollinger(s, period=20, k=2):
@@ -112,13 +116,13 @@ def fib_levels(df, lookback=120):
     hi, lo = float(recent["high"].max()), float(recent["low"].min())
     diff = hi - lo
     return {
-        "0.0%":   hi,
-        "23.6%":  hi - 0.236 * diff,
-        "38.2%":  hi - 0.382 * diff,
-        "50.0%":  hi - 0.500 * diff,
-        "61.8%":  hi - 0.618 * diff,
-        "78.6%":  hi - 0.786 * diff,
-        "100%":   lo,
+        "0.0%":  hi,
+        "23.6%": hi - 0.236 * diff,
+        "38.2%": hi - 0.382 * diff,
+        "50.0%": hi - 0.500 * diff,
+        "61.8%": hi - 0.618 * diff,
+        "78.6%": hi - 0.786 * diff,
+        "100%":  lo,
     }
 
 
@@ -141,13 +145,14 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set) -> go.Figure:
     show_rsi  = "RSI" in indicators
     show_macd = "MACD" in indicators
 
-    # تقسيم الصفوف
     rows = 1
     heights = [0.70]
     if show_rsi:
-        rows += 1; heights.append(0.15)
+        rows += 1
+        heights.append(0.15)
     if show_macd:
-        rows += 1; heights.append(0.15)
+        rows += 1
+        heights.append(0.15)
     total = sum(heights)
     heights = [h / total for h in heights]
 
@@ -218,7 +223,7 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set) -> go.Figure:
                           annotation_text=f"Fib {label}", annotation_position="left",
                           row=1, col=1)
 
-    # --- Pivot Points ---
+    # --- Pivot ---
     if "Pivot Points" in indicators:
         daily = pivot_points(df)
         if len(daily) >= 2:
@@ -228,10 +233,11 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set) -> go.Figure:
                     ("S3", "#26a69a")]
             for name, col in lvls:
                 fig.add_hline(y=prev[name], line_dash="dashdot", line_color=col,
-                              opacity=0.4, annotation_text=f"{name}: {prev[name]:.4f}",
+                              opacity=0.4,
+                              annotation_text=f"{name}: {prev[name]:.4f}",
                               annotation_position="right", row=1, col=1)
 
-    # --- Volume (على محور ثانوي) ---
+    # --- Volume ---
     if "Volume (الحجم)" in indicators:
         vol_colors = ["#26a69a" if c >= o else "#ef5350"
                       for c, o in zip(df["close"], df["open"])]
@@ -245,8 +251,10 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set) -> go.Figure:
         fig.add_trace(go.Scatter(x=df["time"], y=rsi(df["close"]), name="RSI",
                                  line=dict(color="#ba68c8", width=1.5)),
                       row=cur, col=1)
-        fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.5, row=cur, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.5, row=cur, col=1)
+        fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.5,
+                      row=cur, col=1)
+        fig.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.5,
+                      row=cur, col=1)
         fig.update_yaxes(range=[0, 100], title_text="RSI", row=cur, col=1)
         cur += 1
 
@@ -260,8 +268,8 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set) -> go.Figure:
                                  line=dict(color="#ffa726", width=1.4)),
                       row=cur, col=1)
         fig.add_trace(go.Bar(x=df["time"], y=hist, name="Histogram",
-                             marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in hist],
-                             opacity=0.6),
+                             marker_color=["#26a69a" if v >= 0 else "#ef5350"
+                                           for v in hist], opacity=0.6),
                       row=cur, col=1)
         fig.update_yaxes(title_text="MACD", row=cur, col=1)
 
@@ -298,7 +306,6 @@ def render_panel(panel_id: int, default_symbol: str):
     )
     symbol_code = SYMBOLS[symbol_label]
 
-    # صفّان من مربعات الاختيار
     st.markdown("**🔧 المؤشرات**")
     selected = set()
     cols = st.columns(5)
@@ -311,15 +318,13 @@ def render_panel(panel_id: int, default_symbol: str):
             ):
                 selected.add(ind)
 
-    # --- البيانات ---
     try:
-        df = fetch_klines(symbol_code, interval="1m", limit=400)
+        df = fetch_klines(symbol_code, interval="1m", limit=300)
         ticker = fetch_ticker(symbol_code)
     except Exception as e:
         st.error(f"تعذر جلب البيانات: {e}")
         return
 
-    # --- السعر والتغير ---
     last_price = float(ticker.get("lastPrice", df["close"].iloc[-1]))
     change_pct = float(ticker.get("priceChangePercent", 0.0))
     high_24 = float(ticker.get("highPrice", df["high"].max()))
@@ -332,17 +337,16 @@ def render_panel(panel_id: int, default_symbol: str):
     m3.metric("أدنى 24س", f"{low_24:,.4f}")
     m4.metric("حجم 24س (USDT)", f"{vol_24/1e6:,.2f}M")
 
-    # --- الرسم ---
     fig = build_chart(df, f"{symbol_label}  —  USDT (1m)", selected)
     st.plotly_chart(
         fig,
-        use_container_width=True,
+        width='stretch',
         key=f"chart_{panel_id}",
         config={"displaylogo": False, "scrollZoom": True},
     )
 
 
-# ============ الواجهة الرئيسية (تحديث كل 5 ثوانٍ) ============
+# ============ الواجهة الرئيسية ============
 @st.fragment(run_every=5)
 def dashboard():
     st.markdown(
