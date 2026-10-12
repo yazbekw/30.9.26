@@ -1,15 +1,15 @@
 """
-لوحة تحليل العملات والأصول الاحترافية
+لوحة تحليل الأصول الاحترافية
 - رسمان بيانيان جنباً إلى جنب
 - مؤشرات: SMA, EMA, Bollinger, VWAP, S/R (نقاط), Fibonacci, Pivot, Volume, RSI, MACD
 - مصدران: Binance (عملات رقمية) + Yahoo Finance (ذهب، فضة، نفط)
+- إطار زمني قابل للاختيار مع نافذة Pivot تلقائية
 - تحديث تلقائي كل 5 ثوانٍ
 """
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-from datetime import datetime, timedelta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -22,17 +22,27 @@ st.set_page_config(
 )
 
 # ============ قائمة الأصول ============
-# source: binance = عملات رقمية | yahoo = ذهب/فضة/نفط/مؤشرات
 SYMBOLS = {
-    "BTC (بيتكوين)":       {"code": "BTCUSDT",  "source": "binance", "decimals": 2},
-    "ETH (إيثيريوم)":       {"code": "ETHUSDT",  "source": "binance", "decimals": 2},
-    "BNB (بينانس)":         {"code": "BNBUSDT",  "source": "binance", "decimals": 2},
-    "SOL (سولانا)":         {"code": "SOLUSDT",  "source": "binance", "decimals": 3},
-    "XRP (ريبل)":           {"code": "XRPUSDT",  "source": "binance", "decimals": 4},
-    "DOGE (دوجكوين)":       {"code": "DOGEUSDT", "source": "binance", "decimals": 5},
-    "XAU (الذهب)":          {"code": "GC=F",     "source": "yahoo",   "decimals": 2},
-    "XAG (الفضة)":          {"code": "SI=F",     "source": "yahoo",   "decimals": 3},
-    "WTI (النفط)":          {"code": "CL=F",     "source": "yahoo",   "decimals": 2},
+    "BTC (بيتكوين)":   {"code": "BTCUSDT",  "source": "binance", "decimals": 2},
+    "ETH (إيثيريوم)":   {"code": "ETHUSDT",  "source": "binance", "decimals": 2},
+    "BNB (بينانس)":     {"code": "BNBUSDT",  "source": "binance", "decimals": 2},
+    "SOL (سولانا)":     {"code": "SOLUSDT",  "source": "binance", "decimals": 3},
+    "XRP (ريبل)":       {"code": "XRPUSDT",  "source": "binance", "decimals": 4},
+    "DOGE (دوجكوين)":   {"code": "DOGEUSDT", "source": "binance", "decimals": 5},
+    "XAU (الذهب)":      {"code": "GC=F",     "source": "yahoo",   "decimals": 2},
+    "XAG (الفضة)":      {"code": "SI=F",     "source": "yahoo",   "decimals": 3},
+    "WTI (النفط)":      {"code": "CL=F",     "source": "yahoo",   "decimals": 2},
+}
+
+# ============ الأطر الزمنية ============
+TIMEFRAMES = {
+    "1 دقيقة":  {"binance": "1m",  "yahoo": "1m",  "range": "1d",  "window": 15, "limit": 400},
+    "5 دقائق":  {"binance": "5m",  "yahoo": "5m",  "range": "5d",  "window": 10, "limit": 400},
+    "15 دقيقة": {"binance": "15m", "yahoo": "15m", "range": "5d",  "window": 8,  "limit": 400},
+    "30 دقيقة": {"binance": "30m", "yahoo": "30m", "range": "1mo", "window": 6,  "limit": 400},
+    "1 ساعة":   {"binance": "1h",  "yahoo": "60m", "range": "1mo", "window": 5,  "limit": 400},
+    "4 ساعات":  {"binance": "4h",  "yahoo": "1d",  "range": "3mo", "window": 5,  "limit": 400},
+    "يومي":     {"binance": "1d",  "yahoo": "1d",  "range": "1y",  "window": 3,  "limit": 400},
 }
 
 ALL_INDICATORS = [
@@ -53,7 +63,7 @@ DEFAULT_ON = {"SMA (متوسط بسيط)", "Bollinger Bands", "الدعم وال
 
 # ============ جلب البيانات ============
 @st.cache_data(ttl=5, show_spinner=False)
-def fetch_binance(symbol: str, interval: str = "1m", limit: int = 400) -> pd.DataFrame:
+def fetch_binance(symbol: str, interval: str = "15m", limit: int = 400) -> pd.DataFrame:
     url = "https://api.binance.com/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     r = requests.get(url, params=params, timeout=10)
@@ -71,10 +81,10 @@ def fetch_binance(symbol: str, interval: str = "1m", limit: int = 400) -> pd.Dat
 
 
 @st.cache_data(ttl=5, show_spinner=False)
-def fetch_yahoo(symbol: str) -> pd.DataFrame:
+def fetch_yahoo(symbol: str, interval: str = "15m", range_: str = "5d") -> pd.DataFrame:
     """جلب بيانات الذهب/الفضة/النفط من Yahoo Finance بدون مكتبة yfinance"""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"interval": "1m", "range": "1d"}
+    params = {"interval": interval, "range": range_}
     headers = {"User-Agent": "Mozilla/5.0"}
     r = requests.get(url, params=params, headers=headers, timeout=10)
     r.raise_for_status()
@@ -94,22 +104,22 @@ def fetch_yahoo(symbol: str) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=5, show_spinner=False)
-def fetch_ticker_binance(symbol: str) -> dict:
-    url = "https://api.binance.com/api/v3/ticker/24hr"
-    r = requests.get(url, params={"symbol": symbol}, timeout=10)
-    return r.json()
-
-
-def fetch_data(symbol_info: dict) -> pd.DataFrame:
+def fetch_data(symbol_info: dict, tf_config: dict) -> pd.DataFrame:
     if symbol_info["source"] == "binance":
-        return fetch_binance(symbol_info["code"])
+        return fetch_binance(
+            symbol_info["code"],
+            interval=tf_config["binance"],
+            limit=tf_config["limit"],
+        )
     else:
-        return fetch_yahoo(symbol_info["code"])
+        return fetch_yahoo(
+            symbol_info["code"],
+            interval=tf_config["yahoo"],
+            range_=tf_config["range"],
+        )
 
 
-def get_price_stats(df: pd.DataFrame, symbol_info: dict) -> dict:
-    """حساب إحصائيات السعر من البيانات نفسها"""
+def get_price_stats(df: pd.DataFrame) -> dict:
     last = float(df["close"].iloc[-1])
     first = float(df["close"].iloc[0])
     change_pct = ((last - first) / first) * 100 if first else 0.0
@@ -156,31 +166,19 @@ def vwap(df):
     return (tp * df["volume"]).cumsum() / df["volume"].cumsum()
 
 
-# ============ الدعم والمقاومة كنقاط (Pivot Markers) ============
-def find_pivots(df: pd.DataFrame, window: int = 5):
-    """
-    إيجاد نقاط الانعكاس (القمم والقيعان) باستخدام طريقة Fractal
-    window: عدد الشموع قبل/بعد للتأكد من أن النقطة قمة/قاع حقيقي
-    """
+# ============ الدعم والمقاومة كنقاط ============
+def find_pivots(df: pd.DataFrame, window: int = 8):
+    """إيجاد نقاط الانعكاس (Fractal) — نافذة قابلة للتعديل"""
     highs = []
     lows = []
     h = df["high"].values
     l = df["low"].values
     n = len(df)
-
     for i in range(window, n - window):
-        # قمة: أعلى من كل الجيران
         if h[i] == max(h[i - window:i + window + 1]):
-            highs.append({
-                "time": df["time"].iloc[i],
-                "price": float(h[i]),
-            })
-        # قاع: أدنى من كل الجيران
+            highs.append({"time": df["time"].iloc[i], "price": float(h[i])})
         if l[i] == min(l[i - window:i + window + 1]):
-            lows.append({
-                "time": df["time"].iloc[i],
-                "price": float(l[i]),
-            })
+            lows.append({"time": df["time"].iloc[i], "price": float(l[i])})
     return highs, lows
 
 
@@ -214,7 +212,8 @@ def pivot_points(df):
 
 
 # ============ بناء الرسم البياني ============
-def build_chart(df: pd.DataFrame, title: str, indicators: set, decimals: int = 2) -> go.Figure:
+def build_chart(df: pd.DataFrame, title: str, indicators: set,
+                decimals: int = 2, pivot_window: int = 8) -> go.Figure:
     show_vol  = "Volume (الحجم)" in indicators
     show_rsi  = "RSI" in indicators
     show_macd = "MACD" in indicators
@@ -224,7 +223,7 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set, decimals: int = 2
     rows = 1
     heights = [1.0]
     if show_vol:
-        rows += 1; heights.append(0.25)
+        rows += 1; heights.append(0.28)
     if show_rsi:
         rows += 1; heights.append(0.25)
     if show_macd:
@@ -237,7 +236,7 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set, decimals: int = 2
         vertical_spacing=0.04, row_heights=heights,
     )
 
-    # --- الشموع (الصف الأول) ---
+    # --- الشموع ---
     fig.add_trace(go.Candlestick(
         x=df["time"], open=df["open"], high=df["high"],
         low=df["low"], close=df["close"], name="Price",
@@ -248,19 +247,23 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set, decimals: int = 2
     # --- SMA ---
     if "SMA (متوسط بسيط)" in indicators:
         fig.add_trace(go.Scatter(x=df["time"], y=sma(df["close"], 20),
-                                 name="SMA 20", line=dict(color="#ffeb3b", width=1.2)),
+                                 name="SMA 20",
+                                 line=dict(color="#ffeb3b", width=1.2)),
                       row=1, col=1)
         fig.add_trace(go.Scatter(x=df["time"], y=sma(df["close"], 50),
-                                 name="SMA 50", line=dict(color="#ff9800", width=1.2)),
+                                 name="SMA 50",
+                                 line=dict(color="#ff9800", width=1.2)),
                       row=1, col=1)
 
     # --- EMA ---
     if "EMA (متوسط أسّي)" in indicators:
         fig.add_trace(go.Scatter(x=df["time"], y=ema(df["close"], 20),
-                                 name="EMA 20", line=dict(color="#00bcd4", width=1.2)),
+                                 name="EMA 20",
+                                 line=dict(color="#00bcd4", width=1.2)),
                       row=1, col=1)
         fig.add_trace(go.Scatter(x=df["time"], y=ema(df["close"], 50),
-                                 name="EMA 50", line=dict(color="#9c27b0", width=1.2)),
+                                 name="EMA 50",
+                                 line=dict(color="#9c27b0", width=1.2)),
                       row=1, col=1)
 
     # --- Bollinger ---
@@ -271,7 +274,8 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set, decimals: int = 2
                       row=1, col=1)
         fig.add_trace(go.Scatter(x=df["time"], y=lo, name="BB Lower",
                                  line=dict(color="rgba(120,150,255,0.6)", width=1),
-                                 fill="tonexty", fillcolor="rgba(120,150,255,0.07)"),
+                                 fill="tonexty",
+                                 fillcolor="rgba(120,150,255,0.07)"),
                       row=1, col=1)
 
     # --- VWAP ---
@@ -283,46 +287,38 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set, decimals: int = 2
         except Exception:
             pass
 
-    # --- 🔴🟢 الدعم والمقاومة كنقاط (Pivot Markers) ---
+    # --- 🔴🟢 الدعم والمقاومة كنقاط ---
     if show_sr:
-        highs, lows = find_pivots(df, window=5)
+        highs, lows = find_pivots(df, window=pivot_window)
 
-        # المقاومة = قمم سعرية (مثلثات حمراء تشير للأسفل)
         if highs:
             fig.add_trace(go.Scatter(
                 x=[h["time"] for h in highs],
-                y=[h["price"] * 1.0015 for h in highs],  # رفع بسيط للفصل عن الشمعة
-                mode="markers+text",
-                name="🔴 مقاومة (قمة)",
+                y=[h["price"] * 1.0015 for h in highs],
+                mode="markers",
+                name=f"🔴 مقاومة ({len(highs)})",
                 marker=dict(
                     symbol="triangle-down",
-                    size=14,
+                    size=13,
                     color="#ef5350",
                     line=dict(color="white", width=1.5),
                 ),
-                text=["R"] * len(highs),
-                textposition="top center",
-                textfont=dict(color="#ef5350", size=10, family="Arial Black"),
-                hovertemplate="<b>مقاومة</b><br>السعر: %{y:.4f}<br>الوقت: %{x}<extra></extra>",
+                hovertemplate="<b>مقاومة</b><br>السعر: %{y:.4f}<extra></extra>",
             ), row=1, col=1)
 
-        # الدعم = قيعان سعرية (مثلثات خضراء تشير للأعلى)
         if lows:
             fig.add_trace(go.Scatter(
                 x=[l["time"] for l in lows],
-                y=[l["price"] * 0.9985 for l in lows],  # خفض بسيط للفصل عن الشمعة
-                mode="markers+text",
-                name="🟢 دعم (قاع)",
+                y=[l["price"] * 0.9985 for l in lows],
+                mode="markers",
+                name=f"🟢 دعم ({len(lows)})",
                 marker=dict(
                     symbol="triangle-up",
-                    size=14,
+                    size=13,
                     color="#26a69a",
                     line=dict(color="white", width=1.5),
                 ),
-                text=["S"] * len(lows),
-                textposition="bottom center",
-                textfont=dict(color="#26a69a", size=10, family="Arial Black"),
-                hovertemplate="<b>دعم</b><br>السعر: %{y:.4f}<br>الوقت: %{x}<extra></extra>",
+                hovertemplate="<b>دعم</b><br>السعر: %{y:.4f}<extra></extra>",
             ), row=1, col=1)
 
     # --- Fibonacci ---
@@ -331,7 +327,7 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set, decimals: int = 2
         colors = ["#ef5350", "#ff9800", "#ffeb3b", "#8bc34a",
                   "#26a69a", "#00bcd4", "#3f51b5"]
         for (label, val), col in zip(fib.items(), colors):
-            fig.add_hline(y=val, line_dash="dot", line_color=col, opacity=0.4,
+            fig.add_hline(y=val, line_dash="dot", line_color=col, opacity=0.35,
                           annotation_text=f"Fib {label}",
                           annotation_position="left",
                           annotation_font_size=9,
@@ -347,8 +343,8 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set, decimals: int = 2
                         ("R3", "#ef5350"), ("S1", "#26a69a"), ("S2", "#26a69a"),
                         ("S3", "#26a69a")]
                 for name, col in lvls:
-                    fig.add_hline(y=prev[name], line_dash="dashdot", line_color=col,
-                                  opacity=0.3,
+                    fig.add_hline(y=prev[name], line_dash="dashdot",
+                                  line_color=col, opacity=0.3,
                                   annotation_text=f"{name}: {prev[name]:.4f}",
                                   annotation_position="right",
                                   annotation_font_size=9,
@@ -359,7 +355,7 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set, decimals: int = 2
     # ============ الصفوف السفلية ============
     cur_row = 2
 
-    # --- Volume (صف منفصل تماماً) ---
+    # --- Volume (صف منفصل) ---
     if show_vol:
         vol_colors = ["#26a69a" if c >= o else "#ef5350"
                       for c, o in zip(df["close"], df["open"])]
@@ -377,7 +373,8 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set, decimals: int = 2
 
     # --- RSI ---
     if show_rsi:
-        fig.add_trace(go.Scatter(x=df["time"], y=rsi(df["close"]), name="RSI",
+        fig.add_trace(go.Scatter(x=df["time"], y=rsi(df["close"]),
+                                 name="RSI",
                                  line=dict(color="#ba68c8", width=1.5)),
                       row=cur_row, col=1)
         fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.5,
@@ -411,7 +408,6 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set, decimals: int = 2
         )
 
     # ============ التنسيق النهائي ============
-    # ضبط محور السعر تلقائياً مع هامش بسيط
     price_min = float(df["low"].min())
     price_max = float(df["high"].max())
     padding = (price_max - price_min) * 0.05
@@ -424,7 +420,7 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set, decimals: int = 2
     fig.update_layout(
         template="plotly_dark",
         title=dict(text=title, x=0.5, xanchor="center", font=dict(size=15)),
-        height=800,
+        height=850,
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
         margin=dict(l=10, r=60, t=60, b=10),
@@ -442,13 +438,25 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set, decimals: int = 2
 
 # ============ لوحة عملة واحدة ============
 def render_panel(panel_id: int, default_symbol: str):
-    symbol_label = st.selectbox(
-        f"🔸 اختر الأصل — اللوحة {panel_id}",
-        options=list(SYMBOLS.keys()),
-        index=list(SYMBOLS.keys()).index(default_symbol),
-        key=f"symbol_{panel_id}",
-    )
+    # --- اختيار الأصل والإطار ---
+    col_a, col_b = st.columns([2, 1])
+    with col_a:
+        symbol_label = st.selectbox(
+            f"🔸 الأصل — اللوحة {panel_id}",
+            options=list(SYMBOLS.keys()),
+            index=list(SYMBOLS.keys()).index(default_symbol),
+            key=f"symbol_{panel_id}",
+        )
+    with col_b:
+        tf_label = st.selectbox(
+            "⏱ الإطار",
+            options=list(TIMEFRAMES.keys()),
+            index=list(TIMEFRAMES.keys()).index("15 دقيقة"),
+            key=f"tf_{panel_id}",
+        )
+
     symbol_info = SYMBOLS[symbol_label]
+    tf_config = TIMEFRAMES[tf_label]
 
     # --- المؤشرات ---
     st.markdown("**🔧 المؤشرات**")
@@ -465,35 +473,31 @@ def render_panel(panel_id: int, default_symbol: str):
 
     # --- جلب البيانات ---
     try:
-        df = fetch_data(symbol_info)
+        df = fetch_data(symbol_info, tf_config)
         if df.empty:
             st.error(f"لا توجد بيانات لـ {symbol_label}")
             return
-        stats = get_price_stats(df, symbol_info)
+        stats = get_price_stats(df)
     except Exception as e:
         st.error(f"تعذر جلب البيانات: {e}")
         return
 
     # --- السعر والتغير ---
-    last_price = stats["last"]
-    change_pct = stats["change_pct"]
-    high_24 = stats["high"]
-    low_24  = stats["low"]
-    vol_24  = stats["volume"]
-
     d = symbol_info["decimals"]
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("آخر سعر", f"{last_price:,.{d}f}", f"{change_pct:+.2f}%")
-    m2.metric("أعلى", f"{high_24:,.{d}f}")
-    m3.metric("أدنى", f"{low_24:,.{d}f}")
-    m4.metric("حجم", f"{vol_24:,.2f}")
+    m1.metric("آخر سعر", f"{stats['last']:,.{d}f}",
+              f"{stats['change_pct']:+.2f}%")
+    m2.metric("أعلى", f"{stats['high']:,.{d}f}")
+    m3.metric("أدنى", f"{stats['low']:,.{d}f}")
+    m4.metric("حجم", f"{stats['volume']:,.2f}")
 
     # --- الرسم البياني ---
     fig = build_chart(
         df,
-        f"{symbol_label}  —  {symbol_info['code']}",
+        f"{symbol_label}  —  {symbol_info['code']}  ({tf_label})",
         selected,
         decimals=d,
+        pivot_window=tf_config["window"],
     )
     st.plotly_chart(
         fig,
