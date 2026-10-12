@@ -1,8 +1,8 @@
 """
 لوحة تحليل الأصول الاحترافية
-- رسمان بيانيان جنباً إلى جنب
+- رسمان بيانيان بترتيب رأسي (عرض كامل)
 - مؤشرات: SMA, EMA, Bollinger, VWAP, S/R (نقاط), Fibonacci, Pivot, Volume, RSI, MACD
-- مصدران: Binance (عملات رقمية) + Yahoo Finance (ذهب، فضة، نفط)
+- مصدران: Binance (عملات) + Yahoo Finance (ذهب، فضة، نفط)
 - إطار زمني قابل للاختيار مع نافذة Pivot تلقائية
 - تحديث تلقائي كل 5 ثوانٍ
 """
@@ -82,7 +82,7 @@ def fetch_binance(symbol: str, interval: str = "15m", limit: int = 400) -> pd.Da
 
 @st.cache_data(ttl=5, show_spinner=False)
 def fetch_yahoo(symbol: str, interval: str = "15m", range_: str = "5d") -> pd.DataFrame:
-    """جلب بيانات الذهب/الفضة/النفط من Yahoo Finance بدون مكتبة yfinance"""
+    """جلب بيانات الذهب/الفضة/النفط من Yahoo Finance"""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"interval": interval, "range": range_}
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -236,12 +236,15 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set,
         vertical_spacing=0.04, row_heights=heights,
     )
 
-    # --- الشموع ---
+    # --- الشموع (ألوان واضحة) ---
     fig.add_trace(go.Candlestick(
         x=df["time"], open=df["open"], high=df["high"],
         low=df["low"], close=df["close"], name="Price",
-        increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
-        increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350",
+        increasing_line_color="#00e676",
+        decreasing_line_color="#ff1744",
+        increasing_fillcolor="#00e676",
+        decreasing_fillcolor="#ff1744",
+        line=dict(width=1),
     ), row=1, col=1)
 
     # --- SMA ---
@@ -299,9 +302,9 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set,
                 name=f"🔴 مقاومة ({len(highs)})",
                 marker=dict(
                     symbol="triangle-down",
-                    size=13,
+                    size=11,
                     color="#ef5350",
-                    line=dict(color="white", width=1.5),
+                    line=dict(color="#ffffff", width=1.8),
                 ),
                 hovertemplate="<b>مقاومة</b><br>السعر: %{y:.4f}<extra></extra>",
             ), row=1, col=1)
@@ -314,9 +317,9 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set,
                 name=f"🟢 دعم ({len(lows)})",
                 marker=dict(
                     symbol="triangle-up",
-                    size=13,
+                    size=11,
                     color="#26a69a",
-                    line=dict(color="white", width=1.5),
+                    line=dict(color="#ffffff", width=1.8),
                 ),
                 hovertemplate="<b>دعم</b><br>السعر: %{y:.4f}<extra></extra>",
             ), row=1, col=1)
@@ -355,7 +358,7 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set,
     # ============ الصفوف السفلية ============
     cur_row = 2
 
-    # --- Volume (صف منفصل) ---
+    # --- Volume ---
     if show_vol:
         vol_colors = ["#26a69a" if c >= o else "#ef5350"
                       for c, o in zip(df["close"], df["open"])]
@@ -415,31 +418,45 @@ def build_chart(df: pd.DataFrame, title: str, indicators: set,
         range=[price_min - padding, price_max + padding],
         row=1, col=1, title_text="السعر",
         showgrid=True, gridcolor="rgba(255,255,255,0.05)",
+        title_font=dict(size=11),
     )
 
     fig.update_layout(
         template="plotly_dark",
-        title=dict(text=title, x=0.5, xanchor="center", font=dict(size=15)),
-        height=850,
+        title=dict(
+            text=title, x=0.5, xanchor="center",
+            font=dict(size=17, color="#ffffff"),
+        ),
+        height=720,
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
-        margin=dict(l=10, r=60, t=60, b=10),
+        margin=dict(l=15, r=80, t=70, b=15),
         legend=dict(
-            orientation="h", yanchor="bottom", y=1.01,
-            xanchor="right", x=1, font=dict(size=10),
-            bgcolor="rgba(0,0,0,0.3)",
+            orientation="h",
+            yanchor="bottom", y=1.015,
+            xanchor="right", x=1,
+            font=dict(size=11),
+            bgcolor="rgba(20,20,30,0.7)",
+            bordercolor="#444", borderwidth=1,
         ),
         dragmode="pan",
         showlegend=True,
+        font=dict(color="#d1d4dc"),
     )
-    fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
+    fig.update_xaxes(
+        showgrid=True, gridcolor="rgba(255,255,255,0.06)",
+        tickfont=dict(size=11, color="#b0b3bb"),
+    )
+    fig.update_yaxes(
+        tickfont=dict(size=11, color="#b0b3bb"),
+    )
     return fig
 
 
 # ============ لوحة عملة واحدة ============
 def render_panel(panel_id: int, default_symbol: str):
     # --- اختيار الأصل والإطار ---
-    col_a, col_b = st.columns([2, 1])
+    col_a, col_b = st.columns([3, 1])
     with col_a:
         symbol_label = st.selectbox(
             f"🔸 الأصل — اللوحة {panel_id}",
@@ -516,11 +533,19 @@ def dashboard():
         "تحديث تلقائي كل 5 ثوانٍ • 🔴 مقاومة • 🟢 دعم</p>",
         unsafe_allow_html=True,
     )
-    col1, col2 = st.columns(2, gap="medium")
-    with col1:
-        render_panel(1, "BTC (بيتكوين)")
-    with col2:
-        render_panel(2, "XAU (الذهب)")
+
+    # اللوحة الأولى — عرض كامل
+    render_panel(1, "BTC (بيتكوين)")
+
+    # فاصل واضح بين اللوحتين
+    st.markdown(
+        "<hr style='margin: 35px 0; border: 0; "
+        "border-top: 2px solid #333;'>",
+        unsafe_allow_html=True,
+    )
+
+    # اللوحة الثانية — عرض كامل
+    render_panel(2, "XAU (الذهب)")
 
 
 dashboard()
